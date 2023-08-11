@@ -234,57 +234,56 @@ coords_dict.update({tripid : df.reset_index(drop=True) for tripid, df in coords.
 
 #%% pause detection
 
-remove = []
+# remove = []
 
-for key, item in tqdm(coords_dict.items()):
-    #trips with a gap greater than 5 minutes
-    #nameing convention is tripid_0, tripid_1, etc.
-    '''
-    If the app was paused for more than 5 minutes, we'll split that trip into segements
+# for key, item in tqdm(coords_dict.items()):
+#     #trips with a gap greater than 5 minutes
+#     #naming convention is tripid_0, tripid_1, etc.
+#     '''
+#     If the app was paused for more than 5 minutes, we'll split that trip into segments
 
-    steps
-    1: find points that are recorded 5 minutes or more after previous point
+#     steps
+#     1: find points that are recorded 5 minutes or more after previous point
 
-    for every point before this one, change the trip id to _0 and for every point after until
-    next 5 minute gap make it trip_id _1, _2, etc
+#     for every point before this one, change the trip id to _0 and for every point after until
+#     next 5 minute gap make it trip_id _1, _2, etc
 
 
-    '''
+#     '''
     
     
-    item['split_tripid'] = None
+#     item['split_tripid'] = None
     
-    ### Pauses ###
-    pause = item['datetime'].diff() > datetime.timedelta(minutes=15)
-    if pause.sum() > 0:
+#     ### Pauses ###
+#     pause = item['datetime'].diff() > datetime.timedelta(minutes=15)
+#     if pause.sum() > 0:
         
-        # ran this to see how many trips had long pauses
-        # for y in range(1,21):
-        #     x.append((coords[coords.groupby('tripid')['datetime'].diff() > datetime.timedelta(minutes=y)]['tripid'].nunique()))
+#         # ran this to see how many trips had long pauses
+#         # for y in range(1,21):
+#         #     x.append((coords[coords.groupby('tripid')['datetime'].diff() > datetime.timedelta(minutes=y)]['tripid'].nunique()))
         
-        #get list of the positions with a large pause
-        indeces = pause[pause].index.tolist()
-        indeces = [0] + indeces + [item.shape[0]-1]
+#         #get list of the positions with a large pause
+#         indices = pause[pause].index.tolist()
+#         indices = [0] + indices + [item.shape[0]-1]
         
-        #apply names
-        for i in range(0,len(indeces)-1):
-            item.loc[indeces[i]:indeces[i+1],'split_tripid'] = i
+#         #apply names
+#         for i in range(0,len(indices)-1):
+#             item.loc[indices[i]:indices[i+1],'split_tripid'] = i
             
-        #populate new dict
-        for split_tripid in item['split_tripid'].unique():
-            coords_dict[(key,split_tripid)] = item[item['split_tripid']==split_tripid]
+#         #populate new dict
+#         for split_tripid in item['split_tripid'].unique():
+#             coords_dict[(key,split_tripid)] = item[item['split_tripid']==split_tripid]
             
-        #add old trip id to remove list
-        remove.append(key)
+#         #add old trip id to remove list
+#         remove.append(key)
    
-#remove these trips
-for key in remove:
-    coords_dict.pop(key)
+# #remove these trips
+# for key in remove:
+#     coords_dict.pop(key)
 
 
 
 #%% iterate through trip dictionary (not sure how to do with just groupby)
-
 
 remove = []
 
@@ -415,9 +414,93 @@ with (export_fp/'coords_dict.pkl').open('rb') as fh:
 #     simp_dict[key] = simplified_traces
 # =============================================================================
 
-#%% only keep points every 50 ft
+simp_dict = {}
+
+for key, item in coords_dict.items():
+    print('Spacing...')
+    spacing_ft = 50
+    
+    #start with first point
+    keep = item.iloc[[0],:]
+    
+    #recalculate distances
+    item['distance_from_prev'] = item.distance(item.shift(1))
+    
+    #get cumdist
+    item['cumulative_dist'] = item['distance_from_prev'].cumsum()
+    
+    #keep looping until there are no points at or above the spacing threshold
+    while item['cumulative_dist'] >= spacing_ft:
+                
+        try:
+            #find one above 50 and add prev if possible (otherwise add first above 50 if prev value the same as starting)
+            keep_this = item.loc[[item[(spacing_ft - item['cumulative_dist']) >= 0]['cumulative_dist'].idxmin()],:]
+        except:
+            #if there is no point within tolerance than select the max under 0
+            keep_this = item.loc[[item[(spacing_ft - item['cumulative_dist']) < 0]['cumulative_dist'].idxmax()],:]
+        
+        #add point to keep
+        keep = pd.concat([keep,keep_this],ignore_index=True)
+        
+        #remove rest (keep last kept point)
+        item = item[item['sequence'] >= keep_this['sequence'].item()]
+    
+        #recalculate distances
+        item['distance_from_prev'] = item.distance(item.shift(1))
+        
+        #get cumdist
+        item['cumulative_dist'] = item['distance_from_prev'].cumsum()
+    
+    #drop extra columns
+    keep.drop(columns=['distance_from_prev','cumulative_dist'])
+    
+    #add to simp dict for export
+    simp_dict[key] = keep
+    
+#%%
+
+orig = coords_dict[31800]
+item = coords_dict[31800]
 
 
+
+spacing_ft = 50
+
+#start with first point
+keep = item.iloc[[0],:]
+
+#recalculate distances
+item['distance_from_prev'] = item.distance(item.shift(1))
+
+#get cumdist
+item['cumulative_dist'] = item['distance_from_prev'].cumsum()
+
+#keep looping until there are no points at or above the spacing threshold
+while (item['cumulative_dist'] >= spacing_ft).any():
+            
+    #try:
+        #find one above 50 and add prev if possible (otherwise add first above 50 if prev value the same as starting)
+    keep_this = item.loc[[item[(spacing_ft - item['cumulative_dist']) >= 0]['cumulative_dist'].idxmin()],:]
+# =============================================================================
+#     except:
+#         #if there is no point within tolerance than select the max under 0
+#         keep_this = item.loc[[item[(spacing_ft - item['cumulative_dist']) < 0]['cumulative_dist'].idxmax()],:]
+# =============================================================================
+    
+    #add point to keep
+    keep = pd.concat([keep,keep_this],ignore_index=True)
+    
+    #remove rest (keep last kept point)
+    item = item[item['sequence'] >= keep_this['sequence'].item()]
+
+    #recalculate distances
+    item['distance_from_prev'] = item.distance(item.shift(1))
+    
+    #get cumdist
+    item['cumulative_dist'] = item['distance_from_prev'].cumsum()
+
+#drop extra columns
+keep.drop(columns=['distance_from_prev','cumulative_dist'])
 
 
 #%%
@@ -427,7 +510,6 @@ with (export_fp/'coords_dict.pkl').open('rb') as fh:
 #export to final 
 with (export_fp/'simp_dict.pkl').open('wb') as fh:
     pickle.dump(simp_dict,fh)
-
 
 
 

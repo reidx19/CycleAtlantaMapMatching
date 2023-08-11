@@ -75,7 +75,7 @@ else:
     matched_traces = dict()
 
 #load network
-network_fp = r"C:\Users\tpassmore6\Documents\TransitSimData\networks\final_network.gpkg"
+network_fp = export_fp / "final_network.gpkg"
 edges = gpd.read_file(network_fp,layer="links")
 nodes = gpd.read_file(network_fp,layer="nodes")
 
@@ -106,6 +106,92 @@ matcher = DistanceMatcher(map_con,
 #turn network into dict to quickly retrieve geometries
 edges['tup'] = list(zip(edges['A'],edges['B']))
 geos_dict = dict(zip(edges['tup'],edges['geometry']))
+
+#%% one or multi match version
+
+tripid = 9123
+traces = simp_dict[tripid]
+
+#redo sequence to match up with reduced number of points
+traces.reset_index(inplace=True)
+traces.drop(columns=['sequence'],inplace=True)
+traces.rename(columns={'index':'sequence'},inplace=True)
+
+#start recording match time
+start = time.time()
+    
+#get list of coords
+gps_trace = list(zip(traces.geometry.y,traces.geometry.x))
+
+#perform matching
+states, last_matched = matcher.match(gps_trace)
+
+#check if matching happened
+if len(states) == 0 or last_matched < 2:
+    print('Failed')
+
+match_nodes = matcher.path_pred_onlynodes
+
+#reduce the states size with match_nodes
+reduced_states = []
+for i in range(0,len(match_nodes)-1):
+    reduced_states.append((match_nodes[i],match_nodes[i+1]))
+
+#calculate the match ratio
+match_ratio = last_matched / (len(gps_trace)-1)
+    
+#retreive matched edges from network
+geos_list = [geos_dict.get(id,0) for id in reduced_states]
+
+#turn into geodataframe
+matched_trip = gpd.GeoDataFrame(data={'A_B':reduced_states,'geometry':geos_list},geometry='geometry',crs='epsg:2240')
+
+#turn tuple to str
+matched_trip['A_B'] = matched_trip['A_B'].apply(lambda row: f'{row[0]}_{row[1]}')
+
+#reset index to add an edge sequence column
+matched_trip.reset_index(inplace=True)
+matched_trip.rename(columns={'index':'edge_sequence'},inplace=True)
+
+# merge the lines for nearest step
+#merged_line = ops.linemerge(geos_list)
+
+#only find deviance up to last matched
+matched_points = traces.iloc[0:last_matched][['sequence','geometry']]
+
+#calculate distance from matched line
+'''
+We do not know which point matched to which line, so we just find nearest line
+from each point. Will not always be correct.
+'''
+deviation = ckdnearest(matched_points, matched_trip)[['sequence','edge_sequence','A_B','dist_ft']]
+
+#add to dictionary
+matched_traces[tripid] = {
+    'nodes':match_nodes, #list of the matched node ids
+    'edges':reduced_states, #list of the matched edge ids
+    'last_matched':last_matched, #last gps point reached
+    'match_ratio':match_ratio, #percent of points matched
+    'deviation': deviation, #how far was point to matched line (df)
+    'matched_trip': matched_trip, #gdf of matched lines
+    'match_time_sec': time.time() - start, #time it took to match
+    'time': time.time() # record when it was last matched
+    }
+
+#create png for easy examination (later)
+
+#add deviation to traces
+traces = pd.merge(traces,deviation,on='sequence',how='left')
+
+#turn datetime to str for exporting
+traces['datetime'] = traces['datetime'].astype(str)
+traces['time_from_start'] = traces['time_from_start'].astype(str)
+
+#export traces and matched line to gpkg for easy examination
+matched_trip.to_file(export_fp/f"matched_traces/testing/{tripid}.gpkg",layer='matched')
+traces.to_file(export_fp/f"matched_traces/testing/{tripid}.gpkg",layer='points')
+
+#%% matches all
 
 #loop through each trace in dict unless it has already been matched
 for tripid, traces in tqdm(simp_dict.items()):
