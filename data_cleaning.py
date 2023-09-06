@@ -9,16 +9,16 @@ GPS_Clean_Route_Snapping.sql script that Dr. Aditi Misra used. However, some add
 have been added.
 
 Overview
-- Import one of the coords.csv files
+- Imports and combines all of the coords.csv files
 - Add column names and format data
-- Remove all points outside the NAD83 UTM18 (west Georgia) bounds
+- Find duplicate trips
+- Remove all trips with points outside the NAD83 UTM18 (west Georgia) bounds
 - Remove all points with a low accuracy reading (need to figure out how to incorporate this with kalman filter)
 - Remove all trips less than 5 minutes long
 - Remove all points that are more than three hours past the starting time
-- Use Kalman filter to update coordinates and fill in missing timestamps
+- Use Kalman filter to update coordinates and fill in missing timestamps (if needed)
 - Search for unrealistic speed values
-- Use RDP algorithim to simplify lines
-- Reduce points to 10m apart but keep all points kept in the RDP algorithm
+- Reduce points to 50ft apart
 - Export for snapping
 
 """
@@ -30,39 +30,32 @@ import fiona
 import glob
 from shapely.geometry import shape, Point, LineString, MultiPoint, box
 import datetime
-
-
-from pathlib import Path
-
-from tqdm import tqdm
-import rdp
-import contextily as cx
-import matplotlib.pyplot as plt
 pd.options.mode.chained_assignment = None  # default='warn'
 import pickle
-
+from pathlib import Path
+from tqdm import tqdm
 import numpy as np
-import numpy.ma as ma
-from pykalman import KalmanFilter
 
-def log_print(log_entry,exportfp):    
-    '''
-    Function used for creating a quick log file to keep track of progress. Opens
-    a text file and adds the "log_entry" and a new line
-    '''
-    with (exportfp/"output_log.txt").open("a") as file:
-        file.write(log_entry + "\n")
-    print(log_entry)
 
-def turn_to_line(trips):
-    #turn into gdf
-    if turn_to_line:
-        trips['geometry'] = points.sort_values(by=['tripid','datetime']).groupby('tripid')['geometry'].apply(lambda x: LineString(x.tolist()))
-        trips = gpd.GeoDataFrame(trips,geometry='geometry',crs='epsg:4326')
+# For RDP algo:
+# import rdp
+# import contextily as cx
+# import matplotlib.pyplot as plt
+
+# For kalman filter:
+# import numpy as np
+# import numpy.ma as ma
+# from pykalman import KalmanFilter
 
 #export filepath
 export_fp = Path.home() / 'Downloads/cleaned_trips'
 
+#filepaths for traces
+coords_fps = Path.home() / 'Documents/ridership_data/CycleAtlantaClean/9-10-16 Trip Lines and Data/raw data'
+coords_fps = coords_fps.glob('coord*.csv')
+
+#coordinate reference system to project to
+project_crs = "epsg:2240"
 
 #%%
 
@@ -86,11 +79,7 @@ The results are printed to a log file.
 '''
 
 #write start time to log
-log_print(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),export_fp)
-
-#filepaths for traces
-coords_fps = Path.home() / 'Documents/ridership_data/CycleAtlantaClean/9-10-16 Trip Lines and Data/raw data'
-coords_fps = coords_fps.glob('coord*.csv')
+print(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 # initialize empty dataframe and dictionary for adding cleaned data
 coords = pd.DataFrame()
@@ -132,7 +121,7 @@ coords = gpd.GeoDataFrame(coords,geometry='geometry',crs=4326)
 coords.sort_values(['tripid','datetime'],inplace=True)
 
 # count and print number of trips
-log_print(f"{coords['tripid'].nunique()} initial trips found",export_fp)
+print(f"{coords['tripid'].nunique()} initial trips found")
 
 #%% Create trips_df
     
@@ -167,7 +156,7 @@ end_lat.rename('end_lat',inplace=True)
 
 #get number of points
 num_of_points = coords['tripid'].value_counts()
-num_of_points.rename('num_of_points',inplace=True)
+num_of_points.rename('initial_tot_points',inplace=True)
 
 #get average haccuracy
 avg_accuracy = coords.groupby('tripid')['hAccuracy'].mean()
@@ -179,15 +168,15 @@ trips_df.reset_index(inplace=True)
 trips_df.rename(columns={'index':'tripid'},inplace=True)
 
 #make status column
-trips_df['status'] = 'keep'
+trips_df['status'] = 'retain'
 
-#%% GPS cleaning
+#%% GPS cleaning - drop trips
 
 ### find duplicates ###
 #only keep first appearance of a trip
 duplicates = trips_df.drop(columns=['tripid']).duplicated()
-trips_df.loc[duplicates,'status'] = 'duplicate trip'
-log_print(f"{duplicates.sum()} trips are duplicates",export_fp)
+trips_df.loc[duplicates,'status'] = 'dropped - duplicate trip'
+print(f"{duplicates.sum()} trips are duplicates")
 duplicate_tripids = trips_df[duplicates]['tripid'].tolist()
 coords = coords[-coords['tripid'].isin(duplicate_tripids)]
 
@@ -195,19 +184,21 @@ coords = coords[-coords['tripid'].isin(duplicate_tripids)]
 check1 = (coords.geometry.x > -85.0200) & (coords.geometry.x < -83.0000)
 check2 = (coords.geometry.y > 30.6200) & (coords.geometry.y < 35.0000)
 outside = coords[(check1 & check2)==False]['tripid'].drop_duplicates().tolist()
-trips_df.loc[trips_df['tripid'].isin(outside),'status'] = 'outside study area'
+trips_df.loc[trips_df['tripid'].isin(outside),'status'] = 'dropped - outside study area'
 coords = coords[check1 & check2]
 
 #Project Data
-coords.to_crs("epsg:2240",inplace=True)
+coords.to_crs(project_crs,inplace=True)
 
 ### drop any trip that's less than five minutes ###
 start = coords.groupby('tripid')['datetime'].min()
 end = coords.groupby('tripid')['datetime'].max()
 trip_length = end - start
 five_mins = trip_length[trip_length < datetime.timedelta(minutes=5)].index.tolist()
-trips_df.at[trips_df['tripid'].isin(five_mins),'status'] = 'less than 5 mins'
+trips_df.at[trips_df['tripid'].isin(five_mins),'status'] = 'dropped - less than 5 mins'
 coords = coords[-coords['tripid'].isin(five_mins)]
+
+#%% GPS cleaning - drop points
 
 ### remove points that occur three hours after initial point ###
 #find time from start
@@ -222,45 +213,45 @@ In this step we remove points if the haccracy value is more than 2.5 standard de
 hAccuracy_filt = coords.groupby('tripid')['hAccuracy'].transform(lambda x: (x - x.mean()) > (x.std() * 2.5))
 coords = coords[-hAccuracy_filt]
 
-### Drop idle points ###
-'''
-Drop points that have a speed less than 2 mph to clean up the traces
-'''
-coords = coords[coords['speed']>2]
 
-# seperate trips and store in dictionary for further processing
+#%% seperate trips and store in dictionary for further processing
 coords_dict.update({tripid : df.reset_index(drop=True) for tripid, df in coords.groupby('tripid')})
-
 
 #%% pause detection
 
+'''
+8/15/23: Come back to this code later, it does not feel neccessary to get the matching process started
+but it probably should be implemented
+'''
+
 # remove = []
+# gaps = {}
+# trips_df['split_id'] = 0
 
 # for key, item in tqdm(coords_dict.items()):
-#     #trips with a gap greater than 5 minutes
+#     #trips with a gap greater than 15 minutes
 #     #naming convention is tripid_0, tripid_1, etc.
 #     '''
-#     If the app was paused for more than 5 minutes, we'll split that trip into segments
+#     If the app was paused for more than 15 minutes, we'll split that trip into segments
 
 #     steps
-#     1: find points that are recorded 5 minutes or more after previous point
+#     1: find points that are recorded 15 minutes or more after previous point
 
-#     for every point before this one, change the trip id to _0 and for every point after until
-#     next 5 minute gap make it trip_id _1, _2, etc
-
+#     2: split trip up and remove original trace from dict
+    
+#     3: update trips_df with original and new rows representing the new ones
 
 #     '''
-    
     
 #     item['split_tripid'] = None
     
 #     ### Pauses ###
 #     pause = item['datetime'].diff() > datetime.timedelta(minutes=15)
+    
 #     if pause.sum() > 0:
         
-#         # ran this to see how many trips had long pauses
-#         # for y in range(1,21):
-#         #     x.append((coords[coords.groupby('tripid')['datetime'].diff() > datetime.timedelta(minutes=y)]['tripid'].nunique()))
+#         #update the trips df
+#         trips_df.loc[trips_df['tripid']==key,'status'] = f'retain - split into {pause.sum()-1} trips'   
         
 #         #get list of the positions with a large pause
 #         indices = pause[pause].index.tolist()
@@ -269,29 +260,43 @@ coords_dict.update({tripid : df.reset_index(drop=True) for tripid, df in coords.
 #         #apply names
 #         for i in range(0,len(indices)-1):
 #             item.loc[indices[i]:indices[i+1],'split_tripid'] = i
-            
-#         #populate new dict
+                
+#         #populate new dict and add to trips_df
 #         for split_tripid in item['split_tripid'].unique():
-#             coords_dict[(key,split_tripid)] = item[item['split_tripid']==split_tripid]
+#             gaps[(key,split_tripid)] = item[item['split_tripid']==split_tripid]
+#             trip_df = {
+#                 'tripid':key,
+#                 'split_id':split_tripid,
+#                 '':,
+#                 '':
+#                 }
             
 #         #add old trip id to remove list
 #         remove.append(key)
-   
+
 # #remove these trips
 # for key in remove:
 #     coords_dict.pop(key)
 
+# #add the split ones
+# coords_dict.update(gaps)
+
+# use for finding how many trips have long pauses
+# for y in range(1,21):
+#     print((coords[coords.groupby('tripid')['datetime'].diff() > datetime.timedelta(minutes=y)]['tripid'].nunique()))
 
 
 #%% iterate through trip dictionary (not sure how to do with just groupby)
 
 remove = []
-
-for tripid, item in tqdm(coords_dict.items()):
+print('Speed Deviation')
+for key, item in tqdm(coords_dict.items()):
     
-    if isinstance(tripid,tuple):
-        split_id = tripid[1]
-        tripid = tripid[0]
+    if isinstance(key,tuple):
+        split_id = key[1]
+        tripid = key[0]
+    else:
+        tripid = key
     
     ### Deviation ###
     '''
@@ -349,7 +354,7 @@ for tripid, item in tqdm(coords_dict.items()):
     #remove if 1 or fewer points
     if item.shape[0] < 2:
         remove.append(key)
-        trips_df.at[trips_df['tripid']==tripid,'status'] = '1 or fewer points'
+        trips_df.at[trips_df['tripid']==tripid,'status'] = 'dropped - 1 or fewer points'
         continue
     
     #attach sequence and total points for easier GIS examination
@@ -357,29 +362,12 @@ for tripid, item in tqdm(coords_dict.items()):
     item['tot_points'] = item.shape[0]
     
     #update dict
-    coords_dict[tripid] = item
-    #count number of points dropped
-    trips_df.at[trips_df['tripid']==tripid,'post_filter'] = item.shape[0]
+    coords_dict[key] = item
+
 
 #remove trips with 1 or fewer points
 for rem in remove:
     coords_dict.pop(rem)
-
-#%%
-
-#export all_coords
-with (export_fp/'coords_dict.pkl').open('wb') as fh:
-    pickle.dump(coords_dict,fh)
-
-#export trip_df
-trips_df.to_csv(export_fp/'trips.csv',index=False)
-
-#%% import cleaned data
-
-all_trips = pd.read_csv(export_fp/'trips.csv')
-
-with (export_fp/'coords_dict.pkl').open('rb') as fh:
-    coords_dict = pickle.load(fh)
 
 
 #%% run rdp algo (removes too many points)
@@ -414,1060 +402,63 @@ with (export_fp/'coords_dict.pkl').open('rb') as fh:
 #     simp_dict[key] = simplified_traces
 # =============================================================================
 
+
+#%% spacing
+
+#take cumulative distance from original
+#find when value exceeds 50ft and record it
+
 simp_dict = {}
 
-for key, item in coords_dict.items():
-    print('Spacing...')
-    spacing_ft = 50
-    
-    #start with first point
-    keep = item.iloc[[0],:]
-    
-    #recalculate distances
-    item['distance_from_prev'] = item.distance(item.shift(1))
-    
-    #get cumdist
-    item['cumulative_dist'] = item['distance_from_prev'].cumsum()
-    
-    #keep looping until there are no points at or above the spacing threshold
-    while item['cumulative_dist'] >= spacing_ft:
-                
-        try:
-            #find one above 50 and add prev if possible (otherwise add first above 50 if prev value the same as starting)
-            keep_this = item.loc[[item[(spacing_ft - item['cumulative_dist']) >= 0]['cumulative_dist'].idxmin()],:]
-        except:
-            #if there is no point within tolerance than select the max under 0
-            keep_this = item.loc[[item[(spacing_ft - item['cumulative_dist']) < 0]['cumulative_dist'].idxmax()],:]
-        
-        #add point to keep
-        keep = pd.concat([keep,keep_this],ignore_index=True)
-        
-        #remove rest (keep last kept point)
-        item = item[item['sequence'] >= keep_this['sequence'].item()]
-    
-        #recalculate distances
-        item['distance_from_prev'] = item.distance(item.shift(1))
-        
-        #get cumdist
-        item['cumulative_dist'] = item['distance_from_prev'].cumsum()
-    
-    #drop extra columns
-    keep.drop(columns=['distance_from_prev','cumulative_dist'])
-    
-    #add to simp dict for export
-    simp_dict[key] = keep
-    
-#%%
-
-orig = coords_dict[31800]
-item = coords_dict[31800]
-
-
-
-spacing_ft = 50
-
-#start with first point
-keep = item.iloc[[0],:]
-
-#recalculate distances
-item['distance_from_prev'] = item.distance(item.shift(1))
-
-#get cumdist
-item['cumulative_dist'] = item['distance_from_prev'].cumsum()
-
-#keep looping until there are no points at or above the spacing threshold
-while (item['cumulative_dist'] >= spacing_ft).any():
-            
-    #try:
-        #find one above 50 and add prev if possible (otherwise add first above 50 if prev value the same as starting)
-    keep_this = item.loc[[item[(spacing_ft - item['cumulative_dist']) >= 0]['cumulative_dist'].idxmin()],:]
-# =============================================================================
-#     except:
-#         #if there is no point within tolerance than select the max under 0
-#         keep_this = item.loc[[item[(spacing_ft - item['cumulative_dist']) < 0]['cumulative_dist'].idxmax()],:]
-# =============================================================================
-    
-    #add point to keep
-    keep = pd.concat([keep,keep_this],ignore_index=True)
-    
-    #remove rest (keep last kept point)
-    item = item[item['sequence'] >= keep_this['sequence'].item()]
-
-    #recalculate distances
-    item['distance_from_prev'] = item.distance(item.shift(1))
-    
-    #get cumdist
-    item['cumulative_dist'] = item['distance_from_prev'].cumsum()
-
-#drop extra columns
-keep.drop(columns=['distance_from_prev','cumulative_dist'])
-
-
-#%%
-
-
-
-#export to final 
-with (export_fp/'simp_dict.pkl').open('wb') as fh:
-    pickle.dump(simp_dict,fh)
-
-
-
-#%%
-
-def kalman_test(points,tripid,export_fp):
-
-
+print('Reducing number of points')
+for key, item in tqdm(coords_dict.items()):
     '''
-    Use kinematics (assume constant velocity) to smooth out data. Points with low accuracy (high hAccuracy) are
-    removed, but there should be a way to account for this.
+    Drop points that have a speed less than 2 mph to clean up the traces
+    '''
     
-    Adapted code from this:
-    https://stackoverflow.com/questions/43377626/how-to-use-kalman-filter-in-python-for-location-data
+    item = item[item['speed'].abs() >2]
     
-    Read this for more about kalman filters: https://www.bzarg.com/p/how-a-kalman-filter-works-in-pictures/
-    
-    '''   
-      
-    #make sure data is sorted
-    points = points.sort_values('datetime')
-    
-    #export raw data
-    #points.to_file(export_fp/f"selected_trips/{tripid}.gpkg",layer='haccuracy_and_deviation')
-    
-    #make a time elapsed in seconds column
-    points['time_elapsed'] = points['datetime'].apply(lambda x: int((x - points['datetime'].min()).total_seconds()))
-        
-    #project to get x and y values
-    #points.to_crs(crs,inplace=True)
-    
-    points['x'] = points.geometry.x
-    points['y'] = points.geometry.y
-    
-    #create nan entries to fill in missing data
-    fill = pd.DataFrame(data={'time_elapsed':range(0,points['time_elapsed'].max()+1)})
-    fill = pd.merge(fill,points,on='time_elapsed',how='left')
-    
-    #convert our observations to numpy array
-    observations = fill[['x','y']].to_numpy()
-    
-    #errors
-    #errors = fill[['hAccuracy']].to_numpy()
-    #errors = np.concatenate([errors,errors],axis=1)
-    
-    #use np.ma to mask missing data
-    observations = ma.masked_array(observations , mask=np.isnan(observations))
-    #rrors = ma.masked_array(errors, mask=np.isnan(errors))
-    
-    # the initial state of the cyclist (assuming starting from stop)
-    # so initial position in x and y
-    # assume 0 velocity (acceleration is an unaacounted for external influence)
-    initial_state_mean = [observations[0,0],0,observations[0,0],0]
-    
-    #these are the kinematics of how we're moving (ignoring road network and grade)
-    #assume that velocity is constant (not true) but we don't have acceleration information
-    transition_matrix = [[1,1,0,0],
-                          [0,1,0,0],
-                          [0,0,1,1],
-                          [0,0,0,1]]
-    
-    #these are the values we're getting from the phone (just x and y position, we don't know direction)
-    #QUESTION how do we include the other measurements that we're taking? we know hAccuracy is influecing the position and speed is related to speed
-    #also how to account for time skips?
-    observation_matrix = [[1,0,0,0],
-                          [0,0,1,0]]
-        
-    
-    #how confident are we in our measurements (assume x and y don't affect each other)
-    observation_covariance = fill['hAccuracy'].mean()**2 * np.array([[1,0],[0,1]])
-    
-    #using just this estimate a kalman filter
-    kf1 = KalmanFilter(transition_matrices = transition_matrix,
-                      observation_matrices = observation_matrix,
-                      initial_state_mean = initial_state_mean,
-                      observation_covariance= observation_covariance
-                      #observation_offsets=errors
-                      )
-    
-    #get new values
-    (smoothed_state_means, smoothed_state_covariances) = kf1.smooth(observations)
-    
-    #try smoothing again without those points
-    
-    #convert back to dataframe
-    filtered = pd.DataFrame(smoothed_state_means,columns=['x','v_x','y','v_y'])
-    
-    #create an estimated speed column (mph)
-    filtered['speed'] = (filtered['v_x']**2 + filtered['v_y']**2)**0.5
-    
-    #remove points with excessively high speed 47 mph (should probably do this recursively?)
-    #filtered = filtered[filtered['speed']<47]
-    
-    #and remove excesively low speed
-    #filtered = filtered[filtered['speed']>2]
-    
-    #reset index and rename to elapsed time
-    filtered.reset_index(inplace=True)
-    filtered.rename(columns={'index':'time_elapsed'},inplace=True)
-    
-    #merge with points to get all the rest of the data
-    smoothed_df = pd.merge(filtered,points,on='time_elapsed',how='left',suffixes=('_est',None))
-    
-    #make geodataframe
-    smoothed_df['geometry'] = gpd.points_from_xy(smoothed_df['x_est'], smoothed_df['y_est'], crs=points.crs)
-    smoothed_df = gpd.GeoDataFrame(smoothed_df,geometry='geometry')
-    
-    #export
-    smoothed_df.to_file(export_fp/f"selected_trips/{tripid}.gpkg",layer='smoothed_with_covar')
-
-
-
-#%%
-
-
-#plot if desired
-#sample.plot(markersize=0.5)
-
-for tripid, df in sample_coords.items():
-
-    #tripid=9208
-    points = df
-    df.to_crs('epsg:2240',inplace=True)
-    #crs='epsg:2240'
-    
-    # x_min, y_min, x_max, y_max = (2227925.733540652,1374549.6684689275,2228562.6084365235,1375118.3676399956)
-    
-    # #check if one point within bounding box
-    # check1 = ((df.geometry.x < x_max) & (df.geometry.x > x_min))
-    # check2 = ((df.geometry.y < y_max) & (df.geometry.y > y_min))
-    
-    # if (check1 & check2).any() == False:
-    #     print(f'{tripid} does not have point within bbox')
-    #     continue
-    
-    #check if average haccuracy is above 100
-    if df['hAccuracy'].mean() < 100:
-        print('too low haccuracy')
+    #if that removes too many values then drop trip
+    if item.shape[0] == 0:
+        trips_df.at[trips_df['tripid']==key,'status'] = 'dropped - speed values too low'
         continue
     
-    #datetime to str
-    points['datetime'] = points['datetime'].astype(str)
-    points['time_from_start'] = points['datetime'].astype(str)
+    #recalculate distances
+    item['distance_from_prev'] = item.distance(item.shift(1))
     
-    points.to_file(export_fp/f"selected_trips/{tripid}.gpkg",layer='raw')
+    #get cumdist
+    item['cumulative_dist'] = item['distance_from_prev'].cumsum()
     
-    points['datetime'] = pd.to_datetime(points['datetime'])
-    points['time_from_start'] = pd.to_datetime(points['time_from_start'])
+    spacing_ft = 50
+    current_spacing = spacing_ft
     
-    #for key, coords in sample_coords.items():
+    #start with first point
+    keep = [item.index.tolist()[0]]
     
-    #make sure it's sorted
-    points.sort_values('datetime')
-
-    #use kalman filter using error in the offset one
+    for index, value in item['cumulative_dist'].items():
+        if value > current_spacing:
+            keep.append(index)
+            current_spacing = value + spacing_ft
     
-    #use kalman filter using errro in the covariance
-    kalman_test(points,tripid,export_fp)
+    #count number of points dropped
+    trips_df.at[trips_df['tripid']==tripid,'final_tot_points'] = item.shape[0]
     
-    #use kalman filter when dropping high error values and inplausible points
-    points = filter_points(points)
-    kalman_smoothing(points,tripid,export_fp)
-        
-
-
-
-
-
-
-
-#%%try running
-smoothed_dict={}
-for key in tqdm(sample_coords.keys()):
-    smoothed_dict[key] = kalman_smoothing(sample_coords[key],key,haccuracy_max=50,crs="epsg:2240",export_fp=export_fp)
-
-
-#%% 
-
-'''
-In some cases, the kalman filter can result in worse results if the observations are accurate
-'''
-def kalman_smoothing(points,tripid,export_fp):
-    '''
-    Use kinematics (assume constant velocity) to smooth out data. Points with low accuracy (high hAccuracy) are
-    removed, but there should be a way to account for this.
-    
-    Adapted code from this:
-    https://stackoverflow.com/questions/43377626/how-to-use-kalman-filter-in-python-for-location-data
-    
-    Read this for more about kalman filters: https://www.bzarg.com/p/how-a-kalman-filter-works-in-pictures/
-    
-    '''   
-      
-    #plot if desired
-    #sample.plot(markersize=0.5)
-    
-    #make sure data is sorted
-    points = points.sort_values('datetime')
-    
-    #export raw data
-    #points.to_file(export_fp/f"selected_trips/{tripid}.gpkg",layer='raw')
-    
-    # #remove points according to haccuracy
-    # remove_points = points['hAccuracy']<haccuracy_max
-    
-    # if remove_points.sum() < 2:
-    #     print(f'Too high of hAccuracy max for trip {tripid}')
-    # else:
-    #     points = points[points['hAccuracy']<haccuracy_max]
-    
-    #make a time elapsed in seconds column
-    points['time_elapsed'] = points['datetime'].apply(lambda x: int((x - points['datetime'].min()).total_seconds()))
-        
-    #project to get x and y values
-    #points.to_crs(crs,inplace=True)
-    
-    points['x'] = points.geometry.x
-    points['y'] = points.geometry.y
-    
-    #create nan entries to fill in data
-    fill = pd.DataFrame(data={'time_elapsed':range(0,points['time_elapsed'].max()+1)})
-    fill = pd.merge(fill,points,on='time_elapsed',how='left')
-    
-    #convert our observations to numpy array
-    observations = fill[['x','y']].to_numpy()
-    
-    #use np.ma to mask missing data
-    observations = ma.masked_array(observations , mask=np.isnan(observations))
-    
-    # the initial state of the cyclist (assuming starting from stop)
-    # so initial position in x and y
-    # assume 0 velocity (acceleration is an unaacounted for external influence)
-    initial_state_mean = [observations[0,0],0,observations[0,0],0]
-    
-    #these are the kinematics of how we're moving (ignoring road network and grade)
-    #assume that velocity is constant (not true) but we don't have acceleration information
-    transition_matrix = [[1,1,0,0],
-                          [0,1,0,0],
-                          [0,0,1,1],
-                          [0,0,0,1]]
-    
-    #these are the values we're getting from the phone (just x and y position, we don't know direction)
-    #QUESTION how do we include the other measurements that we're taking? we know hAccuracy is influecing the position and speed is related to speed
-    #also how to account for time skips?
-    observation_matrix = [[1,0,0,0],
-                          [0,0,1,0]]
-        
-    #using just this estimate a kalman filter
-    kf1 = KalmanFilter(transition_matrices = transition_matrix,
-                      observation_matrices = observation_matrix,
-                      initial_state_mean = initial_state_mean
-                      )
-    
-    #figure out what em is doing (something about learning new parameters like the two covariance matrices)
-    #kf1 = kf1.em(observations, n_iter=5)
-    #get new values
-    (smoothed_state_means, smoothed_state_covariances) = kf1.smooth(observations)
-    
-    # #can do second filter where we multiply the observation_covariance matrix to essentially say we have less confidence in our measurements
-    # #second run adds observation covariance matrix that smooths out the data even more, increase the multiplication factor to increase smoothing
-    # kf2 = KalmanFilter(transition_matrices = transition_matrix,
-    #                   observation_matrices = observation_matrix,
-    #                   initial_state_mean = initial_state_mean,
-    #                   observation_covariance = 10*kf1.observation_covariance,
-    #                   em_vars=['transition_covariance', 'initial_state_covariance'])
-
-    # kf2 = kf2.em(observations, n_iter=5)
-    # (smoothed_state_means, smoothed_state_covariances)  = kf2.smooth(observations)
-
-    # Plot original and smoothed GPS points
-    # plt.figure(figsize=(8, 6))
-    # plt.plot(measurements[:,0], measurements[:,1], 'bo-', label='Original')
-    # plt.plot(smoothed_state_means[:,0], smoothed_state_means[:,2], 'r.-', label='Smoothed')
-    # plt.xlabel('Longitude')
-    # plt.ylabel('Latitude')
-    # plt.title('Comparison of Original and Smoothed GPS Points')
-    # plt.legend()
-    # plt.grid(True)
-    # plt.show()
-     
-    #try smoothing again without those points
-
-    #convert back to dataframe
-    filtered = pd.DataFrame(smoothed_state_means,columns=['x','v_x','y','v_y'])
-    
-    #create an estimated speed column (mph)
-    filtered['speed'] = (filtered['v_x']**2 + filtered['v_y']**2)**0.5
-    
-    #remove points with excessively high speed 40 mph (should probably do this recursively?)
-    #filtered = filtered[filtered['speed']<40]
-    
-    #and remove excesively low speed
-    #filtered = filtered[filtered['speed']>2]
-
-    #reset index and rename to elapsed time
-    filtered.reset_index(inplace=True)
-    filtered.rename(columns={'index':'time_elapsed'},inplace=True)
-    
-    #merge with points to get all the rest of the data
-    smoothed_df = pd.merge(filtered,points,on='time_elapsed',how='left',suffixes=('_est',None))
-    
-    #make geodataframe
-    smoothed_df['geometry'] = gpd.points_from_xy(smoothed_df['x_est'], smoothed_df['y_est'], crs=points.crs)
-    smoothed_df = gpd.GeoDataFrame(smoothed_df,geometry='geometry')
-    
-    #export
-    smoothed_df.to_file(export_fp/f"selected_trips/{tripid}.gpkg",layer='smoothed_wo_outliers')
-    
-    return smoothed_df
-
-#%% look at speeds
-
-
-
-
-#don't do this because kalman should be accounting for this?
-#throw out high haccuracy
-#trying 15 for now
-# haccuracy_max = 15
-# count = coords.shape[0]
-# coords = coords[coords['hAccuracy']<haccuracy_max]
-# print(f'{count-coords.shape[0]} have above an hAccuracy above {haccuracy_max} meters')
-
-### Sort and add timestamps ###
-
-#use datetime to create sequence column
-#coords['sequence'] = coords.groupby(['tripid']).cumcount()
-
-#make total points column for reference
-#tot_points = coords['tripid'].value_counts().rename('tot_points')
-#coords = pd.merge(coords, tot_points, left_on='tripid',right_index=True)
-
-#sort by sequence and tripid
-
-# Drop trips that are less than five minutes long
-
-
-# need a find duplicate trips code
-
-
-
-
-# move these .gpkg to a new directory
-
-# import os
-# import shutil
-
-# def copy_files(tripid):
-    
-#     source_file = Path.home() / f'Downloads/smoothed_traces/{tripid}.gpkg'
-#     destination_dir = Path.home() / f'Downloads/selected_traces/{tripid}.gpkg'
-    
-#     # Copy the file to the destination directory
-#     shutil.copy2(source_file, destination_dir)
-    
-# [copy_files(x) for x in coords['tripid'].unique().tolist()]
-
-
-    
-
-#%%
-
-
-for tripid in tqdm(coords['tripid'].unique()):
-    
-    #subset to that specific trip
-    sample = coords[coords['tripid']==tripid]
-    
-    #plot if desired
-    #sample.plot(markersize=0.5)
-    
-    #export raw data
-    sample.to_file(Path.home() / f'Downloads/selected_traces/{tripid}.gpkg',layer='raw')
-    
-    #make a time elapsed in seconds column
-    sample['time_elapsed'] = sample['datetime'].apply(lambda x: int((x - sample['datetime'].min()).total_seconds()))
-    
-    # Kalman filtering and smoothing
-    
-    '''
-    
-    With the given info we have (lat-lon in degrees,velocity in m/s, time in secs, and haccuracy in m), we dont have a way of adding kinematic equations to improve the fit
-    so this is basically maximum likelihood estimation.
-    
-    Adapted code from this:
-    https://stackoverflow.com/questions/43377626/how-to-use-kalman-filter-in-python-for-location-data
-    
-    Read this for more about kalman filters: https://www.bzarg.com/p/how-a-kalman-filter-works-in-pictures/
-    
-    '''
-    import numpy as np
-    import numpy.ma as ma
-    from pykalman import KalmanFilter
-    
-    #convert to metric projection to match up with other units
-    #sample.to_crs('epsg:26967',inplace=True)
-    sample.to_crs('epsg:2240',inplace=True)
-    
-    sample['x'] = sample.geometry.x
-    sample['y'] = sample.geometry.y
-    
-    #create nan entries to fill in data
-    fill = pd.DataFrame(data={'time_elapsed':range(0,sample['time_elapsed'].max()+1)})
-    fill = pd.merge(fill,sample,on='time_elapsed',how='left')
-    
-    #convert our observations to numpy array
-    observations = fill[['x','y','hAccuracy','speed']].to_numpy()
-    
-    #use np.ma to mask missing data
-    observations = ma.masked_array(observations , mask=np.isnan(observations))
-    
-    #only keep x and y column for observations
-    observations = observations[:,0:2]
-    
-    # the initial state of the cyclist (assuming starting from stop)
-    # so initial position in x and y
-    # assume 0 velocity (acceleration is an unaacounted for external influence)
-    initial_state_mean = [observations[0,0],0,observations[0,0],0]
-    
-    #these are the kinematics of how we're moving (ignoring road network and grade)
-    #assume that velocity is constant (not true) but we don't have acceleration information
-    transition_matrix = [[1,1,0,0],
-                          [0,1,0,0],
-                          [0,0,1,1],
-                          [0,0,0,1]]
-    
-    #these are the values we're getting from the phone (just x and y position, we don't know direction)
-    #QUESTION how do we include the other measurements that we're taking? we know hAccuracy is influecing the position and speed is related to speed
-    #also how to account for time skips?
-    observation_matrix = [[1,0,0,0],
-                          [0,0,1,0]]
-    
-    #sensor noise (speed and hAccuracy)
-    #
-    #observation_offsets = [1,1]
-    
-    #using just this estimate a kalman filter
-    kf1 = KalmanFilter(transition_matrices = transition_matrix,
-                      observation_matrices = observation_matrix,
-                      initial_state_mean = initial_state_mean
-                      )
-    
-    #get new values
-    smoothed_state_means = kf1.smooth(observations)[0]
-        
-    #convert back to dataframe
-    filtered = pd.DataFrame(smoothed_state_means,columns=['x','v_x','y','v_y'])
-    
-    #create an estimated speed column (mph)
-    filtered['speed'] = (filtered['v_x']**2 + filtered['v_y']**2)**0.5 * 60 * 60 / 5280
-    
-    #reset index and rename to elapsed time
-    filtered.reset_index(inplace=True)
-    filtered.rename(columns={'index':'time_elapsed'},inplace=True)
-    
-    #merge with sample to get all the rest of the data
-    check = pd.merge(filtered,sample,on='time_elapsed',how='left',suffixes=('_est',None))
-    
-    #make geodataframe
-    check['geometry'] = gpd.points_from_xy(check['x_est'], check['y_est'], crs='epsg:2240')
-    check = gpd.GeoDataFrame(check,geometry='geometry')
-    
-    #export
-    check.to_file(Path.home()/f'Downloads/selected_traces/{tripid}.gpkg',layer='smoothed_w_outliers')
-    
-    
-#%%i should figure out what em does
-#kf1 = kf1.em(measurements, n_iter=5)
-(smoothed_state_means, smoothed_state_covariances) = kf1.smooth(measurements)
-
-# #second run adds observation covariance matrix that smooths out the data even more, increase the multiplication factor to increase smoothing
-# kf2 = KalmanFilter(transition_matrices = transition_matrix,
-#                   observation_matrices = observation_matrix,
-#                   initial_state_mean = initial_state_mean,
-#                   observation_covariance = 10*kf1.observation_covariance,
-#                   em_vars=['transition_covariance', 'initial_state_covariance'])
-
-# kf2 = kf2.em(measurements, n_iter=5)
-# (smoothed_state_means, smoothed_state_covariances)  = kf2.smooth(measurements)
-
-# # Plot original and smoothed GPS points
-# plt.figure(figsize=(8, 6))
-# plt.plot(measurements[:,0], measurements[:,1], 'bo-', label='Original')
-# plt.plot(smoothed_state_means[:,0], smoothed_state_means[:,2], 'r.-', label='Smoothed')
-# plt.xlabel('Longitude')
-# plt.ylabel('Latitude')
-# plt.title('Comparison of Original and Smoothed GPS Points')
-# plt.legend()
-# plt.grid(True)
-# plt.show()
-
-
-
-
-#%%
-
-
-
-#%%
-
-
-# Create initial state
-initial_state = [latitude[0], 0, longitude[0], 0]
-
-# Create observation matrix
-observation_matrix = np.array([
-    [1, 0, 0, 0, 0],
-    [0, 0, 1, 0, 0]
-])
-
-# Create transition matrices
-transition_matrices = np.array([
-    [1, 1, 0, 0, 0],
-    [0, 1, 0, 0, 0],
-    [0, 0, 1, 1, 0],
-    [0, 0, 0, 1, 0],
-    [0, 0, 0, 0, 1]
-])
-
-# Create Kalman filter
-kf = KalmanFilter(
-    transition_matrices=transition_matrices,
-    observation_matrices=observation_matrix,
-    initial_state_mean=initial_state,
-    em_vars=['transition_covariance', 'observation_covariance']
-)
-
-# Create empty arrays to store smoothed values
-smoothed_latitude = np.zeros_like(latitude)
-smoothed_longitude = np.zeros_like(longitude)
-
-# Smoothing using Kalman filter
-for t in range(len(latitude)):
-    if t == 0:
-        smoothed_state_means, smoothed_state_covariances = kf.filter_update(
-            initial_state_mean=initial_state,
-            observation=np.array([latitude[t], speed[t], longitude[t], datetime[t], hAccuracy[t]])
-        )
-    else:
-        smoothed_state_means, smoothed_state_covariances = kf.filter_update(
-            filtered_state_mean=smoothed_state_means,
-            filtered_state_covariance=smoothed_state_covariances,
-            observation=np.array([latitude[t], speed[t], longitude[t], datetime[t], hAccuracy[t]])
-        )
-    smoothed_latitude[t] = smoothed_state_means[0]
-    smoothed_longitude[t] = smoothed_state_means[2]
-
-# Plotting
-plt.figure(figsize=(10, 6))
-plt.plot(datetime, latitude, 'r-', label='Original Latitude')
-plt.plot(datetime, longitude, 'b-', label='Original Longitude')
-plt.plot(datetime, smoothed_latitude, 'g-', label='Smoothed Latitude')
-plt.plot(datetime, smoothed_longitude, 'm-', label='Smoothed Longitude')
-plt.xlabel('Datetime')
-plt.ylabel('Coordinate')
-plt.title('GPS Data Smoothing')
-plt.legend()
-plt.grid(True)
-plt.show()
-
-
-
-
-
-
-
-
-
-#%% see what happens when running multiple times
-new_coords = coords.copy()
-
-#run 20 times to see what happends
-for x in range(0,19):
-    new_coords = gps_deviation(new_coords)
-
-#%%turn to lines for examining
-
-#doesn't work don't bother
-
-#merge data
-beforeafter_coords = pd.merge(coords[['tripid','datetime','geometry']],new_coords[['tripid','datetime','geometry']],on=['tripid','datetime'],suffixes=('_before','_after'),how='left')
-
-#make subplots
-fig, (ax1,ax2) = plt.subplots(1,2)
-
-# print to examine
-for x in tqdm(beforeafter_coords['tripid'].unique()):
-    #subset
-    df = beforeafter_coords[beforeafter_coords['tripid']==x]
-    
-    #seperate?
-    
-    #make first plot
-    df.set_geometry('geometry_before',inplace=True)
-    ax1.plot(df.geometry.x,df.geometry.y)
-    #cx.add_basemap(ax1, crs=df.crs)
-    
-    #make second plot
-    df.set_geometry('geometry_after',inplace=True)
-    df.dropna(inplace=True)
-    ax2.plot(df.geometry.x,df.geometry.y)
-    #cx.add_basemap(ax2, crs=df.crs)
-    
-    fig.savefig(Path.home()/f'Downloads/gps_processing/{x}.png')
-    ax1.cla()
-    ax2.cla()
-
-
-
-#%%
-import pickle
-#pickle
-with (Path.home() / 'Downloads/cleaned_coords.pkl').open(mode='wb') as fh:
-    pickle.dump(clean_coords,fh)
-    
-#%%
-
-with (Path.home() / 'Downloads/cleaned_coords.pkl').open(mode='rb') as fh:
-    clean_coords = pickle.load(fh)
-
-#%%Route Simplify
-'''
--Use douglass peucker alogrithim with a 5 foot tolerance to drop points
--Remove all trips that are less than 5 minutes long
--Remove all points recorded more than three hours after the first
-'''
-
-
-clean_coords = clean_coords[-clean_coords['tripid'].isin(less_than_five)]
-
-#greater than three hours
-clean_coords
-
-
-#%%
-
-def turn_into_linestring(points):
-    #turn all trips into lines
-    lines = points.sort_values(by=['tripid','datetime']).groupby('tripid')['geometry'].apply(lambda x: LineString(x.tolist()))
-    
-    #turn timestamps into list
-    timestamps = points.sort_values(by=['tripid','datetime']).groupby('tripid')['datetime'].apply(list)
-
-    #get start time
-    start_time = points.groupby('tripid')['datetime'].min()
-
-    #get end time
-    end_time = points.groupby('tripid')['datetime'].max()
-    
-    #turn into gdf
-    linestrings = gpd.GeoDataFrame({'start_time':start_time,'end_time':end_time,'geometry':lines}, geometry='geometry',crs="epsg:4326")
-    
-    return linestrings
-
-clean_coords.to_crs('epsg:2240',inplace=True)
-
-lines = turn_into_linestring(clean_coords)
-
-
-
-#%%
-
-from shapely.geometry import LineString
-from math import sqrt
-
-def douglas_peucker(line, epsilon):
-    if len(line.coords) < 3:
-        return line.coords[:], line.metadata[:]
-
-    dmax = 0.0
-    index = 0
-
-    for i in range(1, len(line.coords)-1):
-        d = shortest_distance(line.coords[i], line.coords[0], line.coords[-1])
-        if d > dmax:
-            index = i
-            dmax = d
-
-    if dmax >= epsilon:
-        coords_left, metadata_left = douglas_peucker(LineString(line.coords[:index+1]), epsilon)
-        coords_right, metadata_right = douglas_peucker(LineString(line.coords[index:]), epsilon)
-        
-        coords = coords_left[:-1] + coords_right
-        metadata = metadata_left[:-1] + metadata_right
-    else:
-        coords = [line.coords[0], line.coords[-1]]
-        metadata = [line.metadata[0], line.metadata[-1]]
-
-    return coords, metadata
-
-def shortest_distance(p, line_start, line_end):
-    x1, y1 = line_start
-    x2, y2 = line_end
-    x0, y0 = p
-
-    if x1 == x2 and y1 == y2:
-        return sqrt((x2 - x0) ** 2 + (y2 - y0) ** 2)
-
-    numerator = abs((y2 - y1) * x0 - (x2 - x1) * y0 + x2 * y1 - y2 * x1)
-    denominator = sqrt((y2 - y1) ** 2 + (x2 - x1) ** 2)
-
-    return numerator / denominator
-
-
-test = list()
-for row in lines.itertuples():
-    line = row[-1]
-    timestamps = row[0]
-    
-    epsilon = 5
-    
-    simplified_coords, removed_metadata = douglas_peucker(line, epsilon)
-    simplified_line = LineString(simplified_coords)
-    removed_points = [
-        (p, metadata) for p, metadata in zip(line.coords, line.metadata)
-        if p not in simplified_coords
-    ]
-    list.append(removed_points)
-
-#%%
-
-# Example usage
-line_coords = [(0, 0), (1, 1), (2, 2), (2, 2), (3, 1), (4, 0)]
-line_metadata = ['A', 'B', 'C', 'D', 'E', 'F']
-line = LineString(line_coords)
-line.metadata = line_metadata
-epsilon = 0.5
-
-simplified_coords, removed_metadata = douglas_peucker(line, epsilon)
-simplified_line = LineString(simplified_coords)
-removed_points = [
-    (coord, metadata) for coord, metadata in zip(line.coords, line.metadata)
-    if coord not in simplified_coords
-]
-
-print("Removed Points:", removed_points)
-print("Simplified Line:", simplified_line)
-
-
-
-#%%go back to points
-
-full_gdf = gpd.GeoDataFrame()
-
-for row in lines.itertuples():
-    tripid = row[0]
-    #timestamps = row[-2]
-    coords = list(zip(row[-1].coords))
-    coords = [Point(x) for x in coords]
-    #make geodataframe
-    gdf = gpd.GeoDataFrame({'geometry':coords},geometry='geometry',crs='epsg:2240')
-    #add trip id
-    gdf['tripid'] = tripid
-    #concat
-    full_gdf = pd.concat([full_gdf,gdf],ignore_index=True)
-
-#merge back other info
-clean_coords.to_crs('epsg:2240',inplace=True)
-clean_coords_cols = clean_coords.to_wkt()
-before = clean_coords_cols.shape[0]
-
-#convert to wkt for merging
-full_gdf = full_gdf.to_wkt()
-
-new = pd.merge(clean_coords_cols,full_gdf,on=['tripid','geometry'],how="inner")    
-print(f"{before - new.shape[0]} points removed")    
-
-new = new.from_wkt()
-    
-#%%
-
-
-
-
-
-#%%
-
-
-myid_list = gdf_line.index.to_list()
-repeat_list = [len(line.coords) for line in gdf_line['geometry'].unary_union] #how many points in each Linestring
-coords_list = [line.coords for line in gdf_line['geometry'].unary_union]
-
-#make new gdf
-gdf = gpd.GeoDataFrame(columns=['myid', 'order', 'geometry'])
-
-for myid, repeat, coords in zip(myid_list, repeat_list, coords_list):
-    index_num = gdf.shape[0]
-    for i in range(repeat):
-        gdf.loc[index_num+i, 'geometry'] = Point(coords[i])
-        gdf.loc[index_num+i, 'myid'] = myid
-        gdf.loc[index_num+i, 'order'] = i+1
-
-#%%
-gdf['order'] = range(1, 1+len(df))
-
-#you can use groupby method
-gdf.groupby('myid')['geometry'].apply(list)
-
-
-
-
-
-
-
-
-#%% import trip info
-trip = pd.read_csv(path+"trip.csv", header = None)
-col_names = ['tripid','userid','trip_type','description','starttime','endtime','notsure']
-trip.columns = col_names
-
-# these don't seem too accurate
-# #convert to datetime
-# trip['starttime'] = pd.to_datetime(trip['starttime'])
-# trip['endtime'] = pd.to_datetime(trip['endtime'])
-
-# #trip time
-# trip['triptime'] = trip['endtime'] - trip['starttime']
-
-#drop these
-trip.drop(columns=['description','notsure','starttime','endtime'], inplace = True)
-
-#change tripid and userid to str
-trip['tripid'] = trip['tripid'].astype(str)
-trip['userid'] = trip['userid'].astype(str)
-
-#%% import user info
-user = pd.read_csv(path+"user.csv", header=None)
-
-user_col = ['userid','created_date','device','email','age','gender','income','ethnicity','homeZIP','schoolZip','workZip','cyclingfreq','rider_history','rider_type','app_version']
-user.columns = user_col
-
-user.drop(columns=['device','app_version','app_version','email'], inplace=True)
-
-#change userid to str
-user['userid'] = user['userid'].astype(str)
-
-#%% merge trip and users
-
-#join the user information with trip information
-trip_and_user = pd.merge(trip,user,on='userid')
-
-#%% import notes (optional)
-note = pd.read_csv(path+"note.csv", header=None)
-
-#%% pre-filter for creating sample dataset
-
-#only get traces that cross COA borders
-coa = gpd.read_file(r'C:/Users/tpassmore6/Documents/BikewaySimData/base_shapefiles/bikewaysim_study_area/bikewaysim_study_area.shp')
-
-#dissolve points by trip id
-all_coords_dissolved = all_coords.dissolve('tripid').reset_index()
-
-#find traces that are completely within the coa
-#trips_within = all_coords_dissolved.sjoin(coa,predicate='crosses')['tripid'] # use if just crosses
-trips_within = all_coords_dissolved.sjoin(coa,predicate='within')['tripid']
-
-#only keep original columns
-all_coords = all_coords[all_coords['tripid'].isin(trips_within)]
-
-#%% create sample data
-
-
-#select n random trips
-#n = 500
-
-#random_trips = all_coords['tripid'].drop_duplicates().sample(n)
-#trip_mask = all_coords['tripid'].isin(random_trips)
-#sample_coords = all_coords[trip_mask]
-
-#use all
-n = all_coords['tripid'].nunique()
-random_trips = all_coords['tripid']
-sample_coords = all_coords
-
-#export gdf
-sample_coords.to_file(rf'sample_trips/sample_coords_{n}.geojson',driver='GeoJSON')
-
-
-#get user table
-list_of_trips = sample_coords['tripid'].astype(str).drop_duplicates()
-
-#%% now get user/trip info
-
-#drop trips that aren't represented
-sample_trip_and_user = trip_and_user[trip_and_user['tripid'].isin(random_trips)]
-
-#tot datapoints
-sample_trip_and_user['tot_points'] = pd.merge(sample_trip_and_user, tot_points, left_on='tripid',right_index=True)['tot_points']
-
-#average speed
-speed_stats = sample_coords.groupby('tripid').agg({'speed':['mean','median','max']})
-speed_stats.columns = ['_'.join(col).strip() for col in speed_stats.columns.values]
-sample_trip_and_user = pd.merge(sample_trip_and_user,speed_stats,left_on='tripid',right_index=True)
-
-#average distance
-def turn_into_linestring(points):
-    #turn all trips into lines
-    lines = points.sort_values(by=['tripid','datetime']).groupby('tripid')['geometry'].apply(lambda x: LineString(x.tolist()))
-
-    #get start time
-    start_time = points.groupby('tripid')['datetime'].min()
-
-    #get end time
-    end_time = points.groupby('tripid')['datetime'].max()
-    
-    #turn into gdf
-    linestrings = gpd.GeoDataFrame({'start_time':start_time,'end_time':end_time,'geometry':lines}, geometry='geometry',crs="epsg:4326")
-    
-    return linestrings
-
-lines = turn_into_linestring(sample_coords)
-
-#project
-lines = lines.to_crs(epsg='2240')
-
-mean_dist_ft = lines.geometry.length.mean()
-median_dist = lines.geometry.length.median()
-
-#time difference
-#get min, max index
-idx_max = sample_coords.groupby('tripid')['datetime'].transform(max) == sample_coords['datetime']
-idx_min = sample_coords.groupby('tripid')['datetime'].transform(min) == sample_coords['datetime']
-
-#get min, max dfs
-coords_max = sample_coords[idx_max][['tripid','datetime']].rename(columns={'datetime':'maxtime'})
-coords_min = sample_coords[idx_min][['tripid','datetime']].rename(columns={'datetime':'mintime'})
-
-#join these
-coords_dif = pd.merge(coords_max, coords_min, on='tripid')
-
-#find diffrence
-coords_dif['duration'] = coords_dif['maxtime'] - coords_dif['mintime']
-
-#add to trip and user df
-sample_trip_and_user = pd.merge(sample_trip_and_user, coords_dif[['tripid','duration']], on='tripid')
-
-
-#drop geometry
-sample_coords.drop(columns=['geometry'],inplace=True)
-#export csv
-sample_coords.to_csv(rf'sample_trips/sample_coords_{n}.csv',index=False)
-
-
-#export user
-sample_trip_and_user.to_csv(rf'sample_trips/sample_trip_and_user_{n}.csv',index=False)
-
-#%% get summary stats
-
-
-
-
-#%% simplify gps traces
-
-
+    #add to simp dict for export
+    simp_dict[key] = item.loc[keep]
 
 
 #%% export step
 
+#export to final 
+with (export_fp/'coords_dict.pkl').open('wb') as fh:
+    pickle.dump(simp_dict,fh)
+
+#initialize a matching column
+trips_df['matching status'] = 'unmatched'
+trips_df['match_ratio'] = np.nan
+
+#export trip_df
+trips_df.to_csv(export_fp/'trips.csv',index=False)
 
 # #%% deprecated below
 
@@ -1510,7 +501,7 @@ sample_trip_and_user.to_csv(rf'sample_trips/sample_trip_and_user_{n}.csv',index=
 #     end_time = points.groupby('tripid')['datetime'].max()
     
 #     #turn into gdf
-#     linestrings = gpd.GeoDataFrame({'start_time':start_time,'end_time':end_time,'geometry':lines}, geometry='geometry',crs="epsg:2240")
+#     linestrings = gpd.GeoDataFrame({'start_time':start_time,'end_time':end_time,'geometry':lines}, geometry='geometry',crs=project_crs)
     
 #     #write to file
 #     linestrings.to_file(rf'C:\Users\tpassmore6\Documents\GitHub\ridership_data_analysis\{name}.geojson', driver = 'GeoJSON')
