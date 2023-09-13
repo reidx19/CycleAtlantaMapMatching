@@ -12,11 +12,21 @@ import pandas as pd
 import geopandas as gpd
 from leuvenmapmatching.matcher.distance import DistanceMatcher
 from leuvenmapmatching.map.inmem import InMemMap
+from leuvenmapmatching import visualization as mmviz
 import pickle
 import time
 import datetime
 from pathlib import Path
 from tqdm import tqdm
+from shapely.ops import Point, LineString
+
+# import sys
+# import logging
+# import leuvenmapmatching
+# logger = leuvenmapmatching.logger
+
+# logger.setLevel(logging.DEBUG)
+# logger.addHandler(logging.StreamHandler(sys.stdout))
 
 #export filepath
 export_fp = Path.home() / 'Downloads/cleaned_trips'
@@ -28,87 +38,189 @@ with (export_fp/'coords_dict.pkl').open('rb') as fh:
 #load csv of trips
 trips_df = pd.read_csv(export_fp/'trips.csv')
 
+#load network
+network_fp = Path.home() / "Downloads/cleaned_trips/networks/final_network.gpkg"
+#project if neccessary
+edges = gpd.read_file(network_fp,layer="links")
+nodes = gpd.read_file(network_fp,layer="nodes")
+
+#turn network into dict to quickly retrieve geometries
+edges['tup'] = list(zip(edges['A'],edges['B']))
+geos_dict = dict(zip(edges['tup'],edges['geometry']))
+
+# create network graph needed for map matching (using a projected coordinate system so latlon false)
+map_con = InMemMap("marta_osm", use_latlon = False)
+
+#redo the latlon columns
+nodes['X'] = nodes.geometry.x
+nodes['Y'] = nodes.geometry.y
+
+#add edges and nodes to leuven graph network object (make sure latlon is in same order and crs as traces)
+for row in nodes.itertuples(index=False):
+    map_con.add_node(row[0], (row[1], row[2]))
+for row in edges.itertuples(index=False):
+    map_con.add_edge(row[0], row[1])
+ 
+#load traces
+with (export_fp/'coords_dict.pkl').open('rb') as fh:
+    coords_dict = pickle.load(fh)
+    
+#%%set up matching
+matcher = DistanceMatcher(map_con, # the network graph
+                     max_dist=200,  # maximum distance for considering a link a candidate match for a GPS point
+                     min_prob_norm=0.001, # drops routes that are below a certain normalized probability  
+                     #non_emitting_length_factor=0.75, # not sure what this does, it's not in the documentation
+                     non_emitting_states=False, # allow for states that don't have matching GPS points
+                     obs_noise=50, # the standard error in GPS measurement
+                     max_lattice_width=5)  # limits the number of possible routes to consider, can increment if no solution is found
+
+
+#%% one or multi match version
+
+tripid = 17825#14011
+traces = coords_dict[tripid]
+
+#traces = gpd.read_file(export_fp/f"single_example/{tripid}.gpkg",layer='subset')
+
+#redo sequence to match up with reduced number of points
+traces.reset_index(inplace=True)
+traces.drop(columns=['sequence'],inplace=True)
+traces.rename(columns={'index':'sequence'},inplace=True)
+    
+#get list of coords
+gps_trace = list(zip(traces.geometry.x,traces.geometry.y))
+
+#perform matching
+states, last_matched = matcher.match(gps_trace)
+match_nodes = matcher.path_pred_onlynodes
+
+#%%
+matcher.increase_max_lattice_width(1, unique=False,tqdm=tdqdm)
+
+#%%
+
+
+matcher.lattice_dot(file=project_dir/'lattice.dot', precision=3, render=False)
+
+
+#%%
+matcher.print_lattice_stats()
+
+'''
+Example:
+    
+Stats lattice
+-------------
+nbr levels               : 692 # the number of gps points
+nbr lattice              : 18023
+avg lattice[level]       : 26.044797687861273
+min lattice[level]       : 10 
+max lattice[level]       : 42
+avg obs distance         : 19.752777149048935
+last logprob             : -158.6505697219543
+last length              : 692 # numper of gps points matched
+last norm logprob        : -0.22926382907796863
+
+For vertex:
+    <label-observation-nonemitting>
+For edge:
+    <labelstart-labelend-observation-nonemitting>
+
+'''
+
+#reduce the states size with match_nodes
+reduced_states = []
+for i in range(0,len(match_nodes)-1):
+    reduced_states.append((match_nodes[i],match_nodes[i+1]))
+
+#calculate the match ratio
+match_ratio = last_matched / (len(gps_trace)-1)
+    
+#retreive matched edges from network
+geos_list = [geos_dict.get(id,0) for id in reduced_states]
+
+#turn into geodataframe
+matched_trip = gpd.GeoDataFrame(data={'A_B':reduced_states,'geometry':geos_list},geometry='geometry',crs='epsg:2240')
+
+#turn tuple to str
+matched_trip['A_B'] = matched_trip['A_B'].apply(lambda row: f'{row[0]}_{row[1]}')
+
+#reset index to add an edge sequence column
+matched_trip.reset_index(inplace=True)
+matched_trip.rename(columns={'index':'edge_sequence'},inplace=True)
+
+#export traces and matched line to gpkg for easy examination
+matched_trip.to_file(export_fp/f"single_example/{tripid}.gpkg",layer='subset_matched')
+
+#turn datetime to str for exporting
+traces['datetime'] = traces['datetime'].astype(str)
+traces['time_from_start'] = traces['time_from_start'].astype(str)
+
+traces.to_file(export_fp/f"single_example/{tripid}.gpkg",layer='subset_points')
+
+
+#%% get match points
+
+'''
+>>> match = matcher.lattice_best[0]
+>>> match.edge_m.l1, match.edge_m.l2  # Edge start/end labels
+('A', 'B')
+>>> match.edge_m.pi  # Best point on A-B edge
+(1.0, 1.0)
+>>> match.edge_m.p1, match.edge_m.p2  # Locations of A and B
+((1, 1), (1, 3))
+>>> match.edge_o.l1, match.edge_o.l2  # Observation
+('O0', None)
+>>> match.edge_o.pi  # Location of observation O0, because no second location
+(0.8, 0.7)
+>>> match.edge_o.p1  # Same as pi because no interpolation
+(0.8, 0.7)
+'''
+
+traces['interpolated_point'] = pd.Series([ Point(x.edge_m.pi) for x in matcher.lattice_best ])
+traces = traces.loc[0:last_matched]
+traces['match_lines'] = traces.apply(lambda row: LineString([row['geometry'],row['interpolated_point']]),axis=1)
+
+interpolated_points = traces[['sequence','interpolated_point']]
+interpolated_points = gpd.GeoDataFrame(interpolated_points,geometry='interpolated_point')
+
+match_lines = traces[['sequence','match_lines']]
+match_lines = gpd.GeoDataFrame(match_lines,geometry='match_lines')
+match_lines['length'] = match_lines.length
+
+interpolated_points.to_file(export_fp/f"single_example/{tripid}.gpkg",layer='interpolated_points')
+match_lines.to_file(export_fp/f"single_example/{tripid}.gpkg",layer='match_lines')
+
+#%%
+
+test = matcher.lattice[16]
+
+
+m = max(matcher.lattice[4].values_all(), key=lambda m: m.logprob)
+
+
+
+#%%
+#visualization
+mmviz.plot_map(map_con, matcher=matcher,
+               show_labels=True, show_matching=True, show_graph=False,
+               filename=export_fp/"my_plot.png")
+
+print("States\n------")
+print(states)
+print("Nodes\n------")
+print(nodes)
+print("")
+matcher.print_lattice_stats()
+
+#%% matches all
+
 #load existing matches/if none then create a new dict
 if (export_fp/'matched_traces.pkl').exists():
     with (export_fp/'matched_traces.pkl').open('rb') as fh:
         matched_traces = pickle.load(fh)
 else:
     matched_traces = dict()
-
-#load network
-network_fp = r"C:\Users\tpassmore6\Documents\TransitSimData\networks\final_network.gpkg"
-edges = gpd.read_file(network_fp,layer="links")
-nodes = gpd.read_file(network_fp,layer="nodes")
-
-# create network graph needed for map matching
-map_con = InMemMap("marta_osm", use_latlon = False)
-
-#redo the latlon columns
-nodes['lat'] = nodes.geometry.y
-nodes['lon'] = nodes.geometry.x
-
-#add edges and nodes to leuven graph network object (make sure latlon is in same order as traces)
-for idx, row in nodes.iterrows():
-    map_con.add_node(row['N'], (row['lat'], row['lon']))
-for idx, row in edges.iterrows():
-    map_con.add_edge(row['A'], row['B'])
- 
-#set up matching (find explanations for each parameter)
-matcher = DistanceMatcher(map_con,
-                     max_dist=1000,  # ft
-                     min_prob_norm=0.001,
-                     non_emitting_length_factor=0.75,
-                     non_emitting_states=True,
-                     obs_noise=200,
-                     max_lattice_width=5)  
-
-#turn network into dict to quickly retrieve geometries
-edges['tup'] = list(zip(edges['A'],edges['B']))
-geos_dict = dict(zip(edges['tup'],edges['geometry']))
-
-#%% one or multi match version
-
-# tripid = 14011
-# traces = simp_dict[tripid]
-
-# #redo sequence to match up with reduced number of points
-# traces.reset_index(inplace=True)
-# traces.drop(columns=['sequence'],inplace=True)
-# traces.rename(columns={'index':'sequence'},inplace=True)
-    
-# #get list of coords
-# gps_trace = list(zip(traces.geometry.y,traces.geometry.x))
-
-# #perform matching
-# states, last_matched = matcher.match(gps_trace)
-# match_nodes = matcher.path_pred_onlynodes
-
-# #reduce the states size with match_nodes
-# reduced_states = []
-# for i in range(0,len(match_nodes)-1):
-#     reduced_states.append((match_nodes[i],match_nodes[i+1]))
-
-# #calculate the match ratio
-# match_ratio = last_matched / (len(gps_trace)-1)
-    
-# #retreive matched edges from network
-# geos_list = [geos_dict.get(id,0) for id in reduced_states]
-
-# #turn into geodataframe
-# matched_trip = gpd.GeoDataFrame(data={'A_B':reduced_states,'geometry':geos_list},geometry='geometry',crs='epsg:2240')
-
-# #turn tuple to str
-# matched_trip['A_B'] = matched_trip['A_B'].apply(lambda row: f'{row[0]}_{row[1]}')
-
-# #reset index to add an edge sequence column
-# matched_trip.reset_index(inplace=True)
-# matched_trip.rename(columns={'index':'edge_sequence'},inplace=True)
-
-# #export traces and matched line to gpkg for easy examination
-# matched_trip.to_file(export_fp/f"matched_traces/{tripid}.gpkg",layer='matched')
-
-
-#%% matches all
 
 #setup an empty df where matches break, so issues in the network can be identified
 all_unmatched_points = gpd.GeoDataFrame()

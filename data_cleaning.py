@@ -163,7 +163,7 @@ avg_accuracy = coords.groupby('tripid')['hAccuracy'].mean()
 avg_accuracy.rename('avg_accuracy',inplace=True)
 
 #turn into df
-trips_df = pd.concat([start_time,end_time,start_lon,start_lat,end_lon,end_lat,num_of_points,avg_accuracy],axis=1)
+trips_df = pd.concat([start_time,end_time,duration,start_lon,start_lat,end_lon,end_lat,num_of_points,avg_accuracy],axis=1)
 trips_df.reset_index(inplace=True)
 trips_df.rename(columns={'index':'tripid'},inplace=True)
 
