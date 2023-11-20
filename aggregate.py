@@ -179,3 +179,7 @@ edges.drop(columns=['linkid']).to_file(export_fp/'aggregated_data.gpkg',layer='l
 '''
 Need to remove reverse links from network either at this stage or before data will be masked otherwise
 '''
+
+#%%
+
+#find wrongway
