@@ -1,0 +1,80 @@
+{
+    "age": {
+        "-1": "NULL",
+        "0": "NULL",
+        "1": "Less than 18",
+        "2": "18-24",
+        "3": "25-34",
+        "4": "35-44",
+        "5": "45-54",
+        "6": "55-64",
+        "7": "65+"
+    },
+    "gender": {
+        "-1": "NULL",
+        "0": "NULL",
+        "1": "Female",
+        "2": "Male"
+    },
+    "ethnicity": {
+        "-1": "NULL",
+        "0": "NULL",
+        "1": "White",
+        "2": "African American",
+        "3": "Asian",
+        "4": "Native American",
+        "5": "Pacific Islander",
+        "6": "Multi-racial",
+        "7": "Hispanic / Mexican / Latino",
+        "8": "Other"
+    },
+    "income": {
+        "-1": "NULL",
+        "0": "NULL",
+        "1": "Less than $20,000",
+        "2": "$20,000 to $39,999",
+        "3": "$40,000 to $59,999",
+        "4": "$60,000 to $74,999",
+        "5": "$75,000 to $99,999",
+        "6": "$100,000 or greater"
+    },
+    "cycling_freq": {
+        "-1": "NULL",
+        "0": "NULL",
+        "1": "Less than once a month",
+        "2": "Several times per month",
+        "3": "Several times per week",
+        "4": "Daily"
+    },
+    "rider_type": {
+        "-1": "NULL",
+        "0": "NULL",
+        "1": "Strong & fearless",
+        "2": "Enthused & confident",
+        "3": "Comfortable, but cautious",
+        "4": "Interested, but concerned"
+    },
+    "rider_history": {
+        "-1": "NULL",
+        "0": "NULL",
+        "1": "Since childhood",
+        "2": "Several years",
+        "3": "One year or less",
+        "4": "Just trying it out / just started"
+    },
+    "note_type": {
+        "-1": "NULL",
+        "0": "Pavement issue",
+        "1": "Traffic signal",
+        "2": "Enforcement",
+        "3": "Bike parking",
+        "4": "Bike lane issue",
+        "5": "Note this issue",
+        "6": "Bike parking",
+        "7": "Bike shops",
+        "8": "Public restrooms",
+        "9": "Secret passage",
+        "10": "Water fountain",
+        "11": "Note this asset"
+    }
+}

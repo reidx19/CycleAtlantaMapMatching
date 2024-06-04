@@ -5,13 +5,65 @@ Created on Fri Aug 11 21:24:41 2023
 @author: tpassmore6
 """
 
-%%
+import pandas as pd
+import geopandas as gpd
+import numpy.ma as ma
+from pykalman import KalmanFilter
 
-def kalman_test(points,tripid,export_fp):
-
-
+def kalman_speed(df_with_speed_and_time):
     '''
-    Use kinematics (assume constant velocity) to smooth out data. Points with low accuracy (high hAccuracy) are
+    Use kalman filter to smooth out speed data and interpolate acceleration data using
+    recorded speed and timestamps. Uses basic kinematics with a constant speed assumption.
+
+    Take in series/arrays of speed and timestamp and output the smoothed speeds and estimated
+    accelerations.
+
+    Assumes second by second data, so any missing timestamps and filled in and the speed is
+    interpolated.
+    '''
+    
+    #make a time elapsed in seconds column
+    df_with_speed_and_time['time_elapsed'] = df_with_speed_and_time['datetime'].apply(lambda x: int((x - df_with_speed_and_time['datetime'].min()).total_seconds()))
+
+    measurements = np.concat([speeds,timestamps])
+    
+    #use np.ma to mask missing data
+    measurements = ma.masked_array(measurements, mask=np.isnan(measurements))
+    
+    # the initial state of the cyclist (speed = 0 and acceleration = 0)
+    initial_state_mean = [0,0]
+    
+    #these are the kinematics of how we're moving assuming a constant speed (ignores elevation, signals, stop signs, etc)
+    transition_matrix = [[1,1], # position_t-1 + speed_t-1 * t
+                         [0,1]] # speed_t = 0 + speed_t-1
+    
+    #which 
+    observation_matrix = [[1,0],
+                          [0,1]]
+        
+    #estimate a kalman filter
+    kf1 = KalmanFilter(transition_matrices = transition_matrix,
+                      observation_matrices = observation_matrix,
+                      initial_state_mean = initial_state_mean,
+                      )
+    
+    #get new values
+    (smoothed_state_means, smoothed_state_covariances) = kf1.smooth(observations)
+    
+    #convert to dataframe
+    filtered = pd.DataFrame(smoothed_state_means,columns=['speed','v_x','y','v_y'])
+    
+    #reset index and rename to elapsed time
+    filtered.reset_index(inplace=True)
+    filtered.rename(columns={'index':'time_elapsed'},inplace=True)
+    
+    return filtered
+
+def kalman_geo(points,tripid,export_fp):
+    '''
+    Use kinematics (assume constant velocity) to smooth out positional data using XY and timestamps.
+    
+    . Points with low accuracy (high hAccuracy) are
     removed, but there should be a way to account for this.
     
     Adapted code from this:
@@ -110,7 +162,7 @@ def kalman_test(points,tripid,export_fp):
     smoothed_df = gpd.GeoDataFrame(smoothed_df,geometry='geometry')
     
     #export
-    smoothed_df.to_file(export_fp/f"selected_trips/{tripid}.gpkg",layer='smoothed_with_covar')
+    #smoothed_df.to_file(export_fp/f"selected_trips/{tripid}.gpkg",layer='smoothed_with_covar')
 
 
 

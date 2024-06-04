@@ -1,0 +1,8 @@
+{
+    "project_directory":"D:/PROJECTS/GDOT",
+    "studyarea":"D:/RAW/Study_Areas/itp.gpkg",
+    "cycleatlanta":"D:/RAW/CycleAtlanta",
+    "projected_crs_epsg":"epsg:2240",
+    "geofabrik_year": 2023,
+    "maptilerapikey":"get_ur_own"
+}
